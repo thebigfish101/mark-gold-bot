@@ -6,18 +6,22 @@ import requests
 from berth_memory import BerthMemory
 from drive_sync import upload_to_drive, download_from_drive
 
-# === CONFIG ===
+# === ENV VARS ===
 SYMBOL = "XAUUSD"
 RISK_PERCENT = 2
 RRR = 2
 MEMORY_FILE = "berth_memory.json"
-DRIVE_FILE_ID = "your_google_drive_file_id"  # Replace with your real ID
-TELEGRAM_TOKEN = "7993671924:AAHuUJ2cV0_LCC-g50lfPdW1qQsSBeDqg-8"
-CHAT_ID = "1730309333"
+
+MT5_LOGIN = int(os.getenv("MT5_LOGIN"))
+MT5_PASSWORD = os.getenv("MT5_PASSWORD")
+MT5_SERVER = os.getenv("MT5_SERVER")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+DRIVE_FILE_ID = os.getenv("DRIVE_FILE_ID")
 
 # === INIT MT5 ===
 def init_mt5():
-    if not mt5.initialize(login=247110927, password='M@rkbot1', server='Exness-MT5Trial'):
+    if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
         print("❌ MT5 Init failed:", mt5.last_error())
         time.sleep(5)
         return False
@@ -66,7 +70,7 @@ def place_order(direction, entry_price, sl, tp, lot):
         return True
     return False
 
-def get_candles(symbol="XAUUSD", timeframe=mt5.TIMEFRAME_M15, bars=150):
+def get_candles(symbol, timeframe, bars=150):
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
     return pd.DataFrame(rates) if rates is not None else None
 
@@ -84,39 +88,59 @@ def stochastic(df, k_period=5, d_period=3, slowing=3):
     df['stoch_slow'] = df['%D'].rolling(window=slowing).mean()
     return df
 
-def strategy_logic():
-    df = get_candles()
+def is_higher_tf_bullish():
+    df = get_candles(SYMBOL, mt5.TIMEFRAME_H1, 200)
+    if df is None or len(df) < 50:
+        return False
+    ema50 = df['close'].rolling(50).mean().iloc[-1]
+    ema200 = df['close'].rolling(200).mean().iloc[-1]
+    return ema50 > ema200
+
+def is_higher_tf_bearish():
+    df = get_candles(SYMBOL, mt5.TIMEFRAME_H1, 200)
+    if df is None or len(df) < 50:
+        return False
+    ema50 = df['close'].rolling(50).mean().iloc[-1]
+    ema200 = df['close'].rolling(200).mean().iloc[-1]
+    return ema50 < ema200
+
+def check_timeframe_for_signal(tf):
+    df = get_candles(SYMBOL, tf)
     if df is None or len(df) < 30:
         return None
-
     df = vix_fix(df)
     df = stochastic(df)
-
     last = df.iloc[-1]
     mean_wvf = df['wvf'].rolling(22).mean().iloc[-1]
 
-    # === BUY ===
-    if last['wvf'] > mean_wvf + 2 and last['stoch_slow'] < 20:
-        price = mt5.symbol_info_tick(SYMBOL).ask
-        sl = price - 100 * mt5.symbol_info(SYMBOL).point
-        tp = price + 200 * mt5.symbol_info(SYMBOL).point
-        lot = calculate_lot(100, get_balance(), RISK_PERCENT)
-        if place_order("buy", price, sl, tp, lot):
-            msg = f"📈 BUY XAUUSD\nEntry: {price:.2f}\nTP: {tp:.2f}\nSL: {sl:.2f}\nLot: {lot}"
-            send_telegram(msg)
-            return {"timestamp": time.ctime(), "entry": price, "sl": sl, "tp": tp, "direction": "buy", "lot": lot}
+    if last['wvf'] > mean_wvf + 1:  # relaxed
+        if last['stoch_slow'] < 30 and is_higher_tf_bullish():
+            return "buy"
+        elif last['stoch_slow'] > 70 and is_higher_tf_bearish():
+            return "sell"
+    return None
 
-    # === SELL ===
-    if last['wvf'] > mean_wvf + 2 and last['stoch_slow'] > 80:
-        price = mt5.symbol_info_tick(SYMBOL).bid
-        sl = price + 100 * mt5.symbol_info(SYMBOL).point
-        tp = price - 200 * mt5.symbol_info(SYMBOL).point
-        lot = calculate_lot(100, get_balance(), RISK_PERCENT)
-        if place_order("sell", price, sl, tp, lot):
-            msg = f"📉 SELL XAUUSD\nEntry: {price:.2f}\nTP: {tp:.2f}\nSL: {sl:.2f}\nLot: {lot}"
-            send_telegram(msg)
-            return {"timestamp": time.ctime(), "entry": price, "sl": sl, "tp": tp, "direction": "sell", "lot": lot}
+def strategy_logic():
+    signal = check_timeframe_for_signal(mt5.TIMEFRAME_M5)
+    if signal is None:
+        signal = check_timeframe_for_signal(mt5.TIMEFRAME_M15)
+    if signal is None:
+        return None
 
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if not tick:
+        return None
+
+    price = tick.ask if signal == "buy" else tick.bid
+    point = mt5.symbol_info(SYMBOL).point
+    sl = price - 100 * point if signal == "buy" else price + 100 * point
+    tp = price + 200 * point if signal == "buy" else price - 200 * point
+    lot = calculate_lot(100, get_balance(), RISK_PERCENT)
+
+    if place_order(signal, price, sl, tp, lot):
+        msg = f"{'📈' if signal == 'buy' else '📉'} {signal.upper()} XAUUSD\nEntry: {price:.2f}\nTP: {tp:.2f}\nSL: {sl:.2f}\nLot: {lot}"
+        send_telegram(msg)
+        return {"timestamp": time.ctime(), "entry": price, "sl": sl, "tp": tp, "direction": signal, "lot": lot}
     return None
 
 def run_bot():
@@ -127,7 +151,8 @@ def run_bot():
         memory = BerthMemory()
 
     while True:
-        if not mt5.initialize(login=247110927, password='M@rkbot1', server='Exness-MT5Trial'):
+        print(f"📡 Mark scanning @ {time.ctime()}")
+        if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
             print("🔁 Reconnecting...")
             time.sleep(15)
             continue
@@ -139,10 +164,10 @@ def run_bot():
             upload_to_drive(MEMORY_FILE, DRIVE_FILE_ID)
 
         mt5.shutdown()
-        time.sleep(5 * 60)
+        time.sleep(300)
 
 if __name__ == "__main__":
-    print("🤖 Mark is Live: VIX Fix + Stoch + Exness + Telegram + Memory")
+    print("🤖 Mark is Live on Render with Dual-Timeframe Entries!")
     if init_mt5():
         run_bot()
     else:
