@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: mark-gold-bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python mark_bot_real.py"
